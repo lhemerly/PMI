@@ -1,0 +1,7 @@
+#include "pmi/cache.hpp"
+namespace pmi {
+const std::vector<uint8_t>* LruByteCache::get(uint64_t key){auto i=index_.find(key);if(i==index_.end()){stats_.misses++;return nullptr;}stats_.hits++;stats_.bytes_reused+=i->second->bytes.size();lru_.splice(lru_.begin(),lru_,i->second);return &lru_.begin()->bytes;}
+bool LruByteCache::evict_for(size_t needed){while(needed>capacity_-resident_bytes_){auto i=lru_.end();bool found=false;while(i!=lru_.begin()){--i;if(!i->pinned){resident_bytes_-=i->bytes.size();index_.erase(i->key);lru_.erase(i);stats_.evictions++;found=true;break;}}if(!found)return false;}return true;}
+bool LruByteCache::put(uint64_t key,std::vector<uint8_t> bytes){if(bytes.size()>capacity_)return false;auto old=index_.find(key);if(old!=index_.end()){if(old->second->pinned)return false;erase(key);}if(!evict_for(bytes.size()))return false;stats_.bytes_loaded+=bytes.size();lru_.push_front(CacheEntry{key,std::move(bytes),false});resident_bytes_+=lru_.front().bytes.size();index_[key]=lru_.begin();return true;}
+bool LruByteCache::pin(uint64_t key){auto i=index_.find(key);if(i==index_.end())return false;i->second->pinned=true;return true;} bool LruByteCache::unpin(uint64_t key){auto i=index_.find(key);if(i==index_.end())return false;i->second->pinned=false;return true;} bool LruByteCache::erase(uint64_t key){auto i=index_.find(key);if(i==index_.end())return false;if(i->second->pinned)return false;resident_bytes_-=i->second->bytes.size();lru_.erase(i->second);index_.erase(i);return true;}
+}

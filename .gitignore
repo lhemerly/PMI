@@ -1,0 +1,7 @@
+/build/
+/pmi
+/src/*.o
+*.gguf
+*.bin
+manifest.json
+/poor-mans-inference-cpp.zip
