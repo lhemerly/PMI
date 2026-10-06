@@ -27,6 +27,8 @@ struct TensorInfo {
   uint64_t offset{};
   uint64_t byte_length{};
   uint64_t absolute_offset{};
+  // Offsets address this shard, never a concatenation of all model files.
+  uint32_t shard_id{};
 };
 
 struct GgufFile {
@@ -35,6 +37,7 @@ struct GgufFile {
   std::vector<TensorInfo> tensors;
   uint64_t tensor_data_offset{};
   uint64_t file_size{};
+  std::filesystem::path source_path;
 };
 
 class GgufReader {

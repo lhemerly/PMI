@@ -1,27 +1,20 @@
-CXX ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic -Iinclude
-LDFLAGS ?=
+CMAKE ?= cmake
+BUILD_DIR ?= build-standalone
+JOBS ?= 2
 
-SRC := $(wildcard src/*.cpp)
-OBJ := $(SRC:.cpp=.o)
+.PHONY: all clean test cmake-build
+all:
+	$(CMAKE) -S . -B $(BUILD_DIR) -DPMI_WITH_LLAMA=OFF -DCMAKE_BUILD_TYPE=Release
+	$(CMAKE) --build $(BUILD_DIR) -j$(JOBS)
+	cp $(BUILD_DIR)/pmi pmi
 
-.PHONY: all clean test
-all: pmi
+test: all
+	ctest --test-dir $(BUILD_DIR) --output-on-failure
 
-.PHONY: cmake-build
 cmake-build:
-	cmake -S . -B build -DPMI_WITH_LLAMA=ON -DCMAKE_BUILD_TYPE=Release
-	cmake --build build --target pmi -j2
-
-pmi: $(OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
-src/%.o: src/%.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
-
-test: pmi
-	python3 tests/make_fixture.py
-	./pmi self-test tests/fixtures/toy.gguf
+	$(CMAKE) -S . -B build -DPMI_WITH_LLAMA=ON -DCMAKE_BUILD_TYPE=Release
+	$(CMAKE) --build build -j$(JOBS)
 
 clean:
-	rm -f $(OBJ) pmi
+	$(CMAKE) --build $(BUILD_DIR) --target clean
+	rm -f pmi

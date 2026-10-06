@@ -1,0 +1,989 @@
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 033c117..dbe748b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6680,7 +6680,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     const bool y_non_contig = !ggml_vk_dim01_contiguous(src1);
+ 
+     const bool f16_f32_kernel = src1->type == GGML_TYPE_F32;
+-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
++    // An explicit F32 RHS request must not introduce Q8_1 rounding.
++    const bool preserve_f32_rhs = dst->op == GGML_OP_MUL_MAT && !swap_inputs && ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32;
++    bool quantize_y = !preserve_f32_rhs && ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0 && ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, src0->type);
+ 
+     vk_pipeline to_fp16_vk_0 = nullptr;
+     vk_pipeline to_fp16_vk_1 = nullptr;
+diff --git a/include/llama.h b/include/llama.h
+index dea4d46..09efc44 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -210,11 +210,31 @@ extern "C" {
+         LLAMA_LOAD_MODE_MLOCK      =  2, // force system to keep model in RAM rather than swapping or compressing
+         LLAMA_LOAD_MODE_MMAP_MLOCK =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
+         LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
++        LLAMA_LOAD_MODE_DIRECT_IO_REQUIRED = 5, // require Linux direct payload I/O, without buffered fallback or lazy mmap
+     };
+ 
+     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
+     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
+ 
++    // Snapshot of loader payload reads. Excludes separate metadata reads, mmap access, and external tensor providers.
++    // Payload counters cover logical read_raw requests; read counters include alignment overlap, not physical disk traffic.
++    struct llama_model_load_io_info {
++        bool direct_io_requested;
++        bool direct_io_required;
++        bool direct_io_active;
++        uint64_t payload_requested_bytes;
++        uint64_t payload_completed_bytes;
++        uint64_t direct_read_bytes;
++        uint64_t buffered_read_bytes;
++        uint64_t staging_peak_bytes;
++        uint64_t fallback_count;
++    };
++
++    // Indexed in input shard order and immutable after a successful load; copies the snapshot into out.
++    LLAMA_API size_t llama_model_load_io_count(const struct llama_model * model);
++    LLAMA_API bool llama_model_get_load_io_info(const struct llama_model * model, size_t shard_index,
++                                              struct llama_model_load_io_info * out);
++
+     enum llama_lazy_mode {
+         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
+         LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+@@ -316,6 +336,16 @@ extern "C" {
+         ggml_backend_buffer_type_t buft;
+     };
+ 
++    // Experimental local extension: CPU weights stored outside the model buffers.
++    // Selection metadata is valid only during the callback. Operation weight descriptors live with the model.
++    // Callbacks must not throw. User data must outlive the model and all its contexts.
++    typedef bool (*llama_external_tensor_callback)(const struct ggml_tensor * metadata, void * user_data);
++    // MUL_MAT_ID: input = activations, ids = expert IDs. GET_ROWS: input = row IDs, ids = NULL.
++    // Return a CPU GGML_OP_CUSTOM tensor with ordinary inputs; never add the deferred weight as a graph source.
++    typedef struct ggml_tensor * (*llama_external_tensor_op_callback)(
++            struct ggml_context * ctx, enum ggml_op op, const struct ggml_tensor * weight,
++            struct ggml_tensor * input, struct ggml_tensor * ids, void * user_data);
++
+     struct llama_model_params {
+         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
+         ggml_backend_dev_t * devices;
+@@ -346,6 +376,12 @@ extern "C" {
+         // override key-value pairs of the model meta data
+         const struct llama_model_kv_override * kv_overrides;
+ 
++        // Both callbacks or neither. Requires n_gpu_layers = 0 and disables mmap/lazy loading.
++        // Supported deferred weights: expert MUL_MAT_ID weights and Qwen4Exp PLE embeddings.
++        llama_external_tensor_callback external_tensor;
++        llama_external_tensor_op_callback external_tensor_op;
++        void * external_tensor_user_data;
++
+         // Keep the booleans together to avoid misalignment during copy-by-value.
+         bool vocab_only;      // only load the vocabulary, no weights
+         bool check_tensors;   // validate model tensor data
+@@ -353,6 +389,7 @@ extern "C" {
+         bool no_host;         // bypass host buffer allowing extra buffers to be used
+         bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
++        bool prefetch_mmap;   // prefetch initial mmap data; does not bound RSS or disable explicit row prefetch
+     };
+ 
+     struct llama_sampler_seq_config {
+@@ -518,6 +555,30 @@ extern "C" {
+ 
+     // Load a model from a file
+     // If the file is split into multiple parts, the file name must follow this pattern: <name>-%05d-of-%05d.gguf
++    enum llama_load_event_kind {
++        LLAMA_LOAD_BUFFER_BEGIN, LLAMA_LOAD_BUFFER_READY,
++        LLAMA_LOAD_TENSOR_BEGIN, LLAMA_LOAD_TENSOR_END,
++        LLAMA_LOAD_READ_BEGIN, LLAMA_LOAD_READ_END, LLAMA_LOAD_COPY_END
++    };
++    struct llama_load_event {
++        enum llama_load_event_kind kind;
++        uint64_t monotonic_ns, duration_ns;
++        int32_t shard_index;
++        const char * tensor_name;
++        uint64_t offset, requested_bytes, completed_bytes;
++        void * owned_cpu_buffer;
++        uint64_t owned_cpu_bytes;
++    };
++    // Synchronous borrowed event data; callback must not throw or reenter loading.
++    typedef bool (*llama_load_observer_callback)(const struct llama_load_event *, void *);
++    struct llama_load_observer {
++        llama_load_observer_callback callback;
++        void * user_data;
++    };
++    LLAMA_API struct llama_model * llama_model_load_from_splits_observed(
++        const char ** paths, size_t n_paths, struct llama_model_params params,
++        const struct llama_load_observer * observer);
++
+     // If the split file name does not follow this pattern, use llama_model_load_from_splits
+     LLAMA_API struct llama_model * llama_model_load_from_file(
+                              const char * path_model,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 4f04db0..abed329 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -92,6 +92,10 @@ llama_context::llama_context(
+     //     may need to be backend-dependent
+     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+ 
++    if (!model.external_tensors.empty() && (params.op_offload || params.offload_kqv)) {
++        throw std::runtime_error("external tensors require op_offload = false and offload_kqv = false");
++    }
++
+     t_start_us = model.t_start_us;
+     t_load_us  = model.t_load_us;
+ 
+@@ -2596,6 +2600,7 @@ llm_graph_params llama_context::graph_params(
+         /*.mctx        =*/ mctx,
+         /*.cross       =*/ &cross,
+         /*.prec_policy =*/ &model.prec_policy,
++        /*.external_model =*/ model.external_tensors.empty() ? nullptr : &model,
+         /*.samplers    =*/ sampling.samplers,
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ae477c0..cb57a9e 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1495,6 +1495,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     mctx             (params.mctx),
+     cross            (params.cross),
+     prec_policy      (params.prec_policy),
++    external_model   (params.external_model),
+     samplers         (params.samplers),
+     cb_func          (params.cb),
+     res              (params.res),
+@@ -1561,7 +1562,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * cur, // ggml_tensor * b
+           ggml_tensor * ids,
+           ggml_tensor * w_s) const {
+-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
++    ggml_tensor * res = external_model ? external_model->build_external_tensor_op(ctx0, GGML_OP_MUL_MAT_ID, w, cur, ids) : nullptr;
++    if (!res) {
++        res = ggml_mul_mat_id(ctx0, w, cur, ids);
++    }
+ 
+     if (prec_policy) {
+         prec_policy->apply(res);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3daa425..c912b31 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -19,6 +19,7 @@ struct ggml_tensor;
+ 
+ struct llama_cparams;
+ struct llama_layer;
++struct llama_model;
+ struct llama_prec_policy;
+ 
+ struct llama_memory_context_i;
+@@ -789,6 +790,7 @@ struct llm_graph_params {
+     const llama_cross            * cross;
+ 
+     const llama_prec_policy * prec_policy = nullptr;
++    const llama_model * external_model = nullptr;
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+@@ -1031,6 +1033,7 @@ struct llm_graph_context {
+     const llama_cross            * cross;
+ 
+     const llama_prec_policy * prec_policy;
++    const llama_model * external_model;
+ 
+     std::map<llama_seq_id, llama_sampler *> samplers;
+ 
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 045489d..f341b26 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-mmap.h"
++#include "llama-load-observer.h"
+ 
+ #include "llama-impl.h"
+ 
+@@ -84,7 +85,12 @@ struct llama_file::impl {
+         return ret;
+     }
+ 
+-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
++    impl(const char * fname, const char * mode, const bool use_direct_io = false, const bool require_direct_io = false) {
++        io_info.direct_io_requested = use_direct_io || require_direct_io;
++        io_info.direct_io_required = require_direct_io;
++        if (require_direct_io) {
++            throw std::runtime_error("required direct I/O is only supported on Linux");
++        }
+         fp = ggml_fopen(fname, mode);
+         if (fp == NULL) {
+             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
+@@ -133,6 +139,7 @@ struct llama_file::impl {
+             size_t chunk_size = std::min<size_t>(len - bytes_read, 64*1024*1024);
+             DWORD chunk_read = 0;
+             BOOL result = ReadFile(fp_win32, reinterpret_cast<char*>(ptr) + bytes_read, chunk_size, &chunk_read, NULL);
++            io_info.buffered_read_bytes += chunk_read;
+             if (!result) {
+                 throw std::runtime_error(format("read error: %s", GetErrorMessageWin32(GetLastError()).c_str()));
+             }
+@@ -181,16 +188,29 @@ struct llama_file::impl {
+         }
+     }
+ #else
+-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
++    impl(const char * fname, const char * mode, const bool use_direct_io = false, const bool require_direct_io = false) : fname(fname) {
++        io_info.direct_io_requested = use_direct_io || require_direct_io;
++        io_info.direct_io_required = require_direct_io;
+ #ifdef __linux__
++        if (require_direct_io && std::strcmp(mode, "rb") != 0) {
++            throw std::runtime_error("required direct I/O needs a read-only file");
++        }
+         // Try unbuffered I/O for read only
+-        if (use_direct_io && std::strcmp(mode, "rb") == 0) {
++        if (io_info.direct_io_requested && std::strcmp(mode, "rb") == 0) {
+             if (init_fd()) {
+                 return;
+             }
++            if (require_direct_io) {
++                throw std::runtime_error(format("required direct I/O open failed for '%s': %s", fname, strerror(errno)));
++            }
++            io_info.fallback_count++;
+             LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
+                            fname, strerror(errno));
+         }
++#else
++        if (require_direct_io) {
++            throw std::runtime_error("required direct I/O is only supported on Linux");
++        }
+ #endif
+         init_fp(mode);
+     }
+@@ -201,14 +221,32 @@ struct llama_file::impl {
+ 
+         if (fd != -1) {
+             struct stat file_stats{};
+-            fstat(fd, &file_stats);
++            if (fstat(fd, &file_stats) != 0) {
++                const int saved_errno = errno;
++                close(fd);
++                fd = -1;
++                errno = saved_errno;
++                return false;
++            }
++
++            const auto block_size = file_stats.st_blksize;
++            if (block_size < (int64_t) sizeof(void *) || block_size > LLAMA_DIRECT_IO_BUFFER_SIZE ||
++                    (block_size & (block_size - 1)) != 0) {
++                close(fd);
++                fd = -1;
++                errno = EINVAL;
++                return false;
++            }
+ 
+             size = file_stats.st_size;
+             alignment = file_stats.st_blksize;
+ 
+             off_t ret = lseek(fd, 0, SEEK_SET);
+             if (ret == -1) {
+-                throw std::runtime_error(format("seek error: %s", strerror(errno)));
++                const int saved_errno = errno;
++                close(fd);
++                fd = -1;
++                throw std::runtime_error(format("seek error: %s", strerror(saved_errno)));
+             }
+             return true;
+         }
+@@ -269,13 +307,17 @@ struct llama_file::impl {
+         errno = 0;
+         if (fd == -1) {
+             const size_t curr_off = tell();
++            if (curr_off > size) {
++                throw std::runtime_error("read starts beyond end of file");
++            }
+             const size_t to_read = std::min(len, size - curr_off);
+ 
+-            std::size_t ret = std::fread(ptr, to_read, 1, fp);
++            std::size_t ret = std::fread(ptr, 1, to_read, fp);
++            io_info.buffered_read_bytes += ret;
+             if (ferror(fp)) {
+                 throw std::runtime_error(format("read error: %s", strerror(errno)));
+             }
+-            if (to_read > 0 && ret != 1) {
++            if (ret != to_read) {
+                 throw std::runtime_error("unexpectedly reached end of file");
+             }
+         } else {
+@@ -290,6 +332,10 @@ struct llama_file::impl {
+                     }
+                     // Fallback to std::fread in case the DMA controller cannot access the buffer
+                     if (errno == EFAULT || errno == EINVAL) {
++                        if (io_info.direct_io_required) {
++                            throw std::runtime_error(format("required direct I/O read failed: %s", strerror(errno)));
++                        }
++                        io_info.fallback_count++;
+                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
+                         auto curr_off = tell();
+                         close(fd);
+@@ -297,7 +343,7 @@ struct llama_file::impl {
+                         alignment = 1;
+                         init_fp("rb");
+                         seek(curr_off, SEEK_SET);
+-                        read_raw_unsafe(ptr, len);
++                        read_raw_unsafe(reinterpret_cast<char *>(ptr) + bytes_read, len - bytes_read);
+                         return;
+                     }
+                     throw std::runtime_error(format("read error: %s", strerror(errno)));
+@@ -313,14 +359,29 @@ struct llama_file::impl {
+                 }
+ 
+                 bytes_read += (size_t) ret;
++                io_info.direct_read_bytes += (size_t) ret;
++                if ((size_t) ret < to_read && tell() == size) {
++                    std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
++                    return;
++                }
+             }
+         }
+     }
+ 
+     void read_aligned_chunk(void * dest, size_t size) {
++        if (size == 0) {
++            return;
++        }
+         size_t offset = tell();
++        if (offset > this->size || size > this->size - offset) {
++            throw std::runtime_error("direct read extends beyond end of file");
++        }
+         off_t aligned_offset = offset & ~(alignment - 1);
+         off_t offset_from_alignment = offset - aligned_offset;
++        if (size > SIZE_MAX - (size_t) offset_from_alignment ||
++                size + (size_t) offset_from_alignment > SIZE_MAX - (alignment - 1)) {
++            throw std::runtime_error("direct read alignment overflow");
++        }
+         size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
+ 
+         // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
+@@ -331,6 +392,7 @@ struct llama_file::impl {
+         if (ret != 0) {
+             throw std::runtime_error(format("posix_memalign failed with error %d", ret));
+         }
++        io_info.staging_peak_bytes = std::max<uint64_t>(io_info.staging_peak_bytes, buffer_size);
+ 
+         struct aligned_buffer_deleter {
+             void operator()(void * p) const { free(p); }
+@@ -343,15 +405,25 @@ struct llama_file::impl {
+         size_t copied = 0;
+         for (size_t done = 0; done < bytes_to_read; ) {
+             const size_t n = std::min(buffer_size, bytes_to_read - done);
++            const bool observed = llama_current_load_observer && llama_load_tensor;
++            const auto read_start = observed ? llama_load_clock_ns() : 0;
++            const auto prior_bytes = io_info.direct_read_bytes;
++            if (observed) llama_observe_load(LLAMA_LOAD_READ_BEGIN, aligned_offset + done, n);
+             read_raw_unsafe(buffer.get(), n);
++            if (observed) llama_observe_load(LLAMA_LOAD_READ_END, aligned_offset + done, n,
++                io_info.direct_read_bytes - prior_bytes, llama_load_clock_ns() - read_start);
+ 
+             const size_t count = std::min(n - skip, size - copied);
++            const auto copy_start = observed ? llama_load_clock_ns() : 0;
+             memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(buffer.get()) + skip, count);
++            if (observed) llama_observe_load(LLAMA_LOAD_COPY_END, offset + copied, count, count,
++                llama_load_clock_ns() - copy_start);
+ 
+             copied += count;
+             skip    = 0;
+             done   += n;
+         }
++        seek(offset + size, SEEK_SET);
+     }
+ 
+     void read_raw(void * ptr, size_t len) {
+@@ -407,10 +479,11 @@ struct llama_file::impl {
+     FILE * fp{};
+     size_t size{};
+     bool owns_fp = true;
++    llama_model_load_io_info io_info{};
+ };
+ 
+-llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io) :
+-    pimpl(std::make_unique<impl>(fname, mode, use_direct_io)) {}
++llama_file::llama_file(const char * fname, const char * mode, const bool use_direct_io, const bool require_direct_io) :
++    pimpl(std::make_unique<impl>(fname, mode, use_direct_io, require_direct_io)) {}
+ 
+ llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
+ 
+@@ -421,6 +494,13 @@ size_t llama_file::size() const { return pimpl->size; }
+ 
+ size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
+ bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
++llama_model_load_io_info llama_file::load_io_info() const {
++    auto result = pimpl->io_info;
++#ifdef __linux__
++    result.direct_io_active = pimpl->has_direct_io();
++#endif
++    return result;
++}
+ 
+ int llama_file::file_id() const {
+ #ifdef _WIN32
+@@ -438,14 +518,29 @@ int llama_file::file_id() const {
+ }
+ 
+ void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
+-void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
++void llama_file::read_raw(void * ptr, size_t len) {
++    pimpl->io_info.payload_requested_bytes += len;
++    if (len == 0) {
++        return;
++    }
++    const size_t offset = pimpl->tell();
++    if (offset > pimpl->size || len > pimpl->size - offset) {
++        throw std::runtime_error("read extends beyond end of file");
++    }
++    pimpl->read_raw(ptr, len);
++    pimpl->io_info.payload_completed_bytes += len;
++}
+ #ifdef _WIN32
+ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+ #else
+ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
+ #endif
+ 
+-uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
++uint32_t llama_file::read_u32() {
++    uint32_t value;
++    read_raw(&value, sizeof(value));
++    return value;
++}
+ 
+ void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
+ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index 6c6393d..cd1507d 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "llama.h"
++
+ #include <cstdint>
+ #include <memory>
+ #include <utility>
+@@ -18,7 +20,7 @@ using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
+ using llama_mlocks = std::vector<std::unique_ptr<llama_mlock>>;
+ 
+ struct llama_file {
+-    llama_file(const char * fname, const char * mode, bool use_direct_io = false);
++    llama_file(const char * fname, const char * mode, bool use_direct_io = false, bool require_direct_io = false);
+     llama_file(FILE * file);
+     ~llama_file();
+ 
+@@ -39,6 +41,7 @@ struct llama_file {
+ 
+     size_t read_alignment() const;
+     bool has_direct_io() const;
++    llama_model_load_io_info load_io_info() const;
+ private:
+     struct impl;
+     std::unique_ptr<impl> pimpl;
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 6cc0b20..cb9bef6 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model-loader.h"
++#include "llama-load-observer.h"
+ 
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+@@ -556,8 +557,17 @@ llama_model_loader::llama_model_loader(
+ 
+     tensor_buft_overrides = param_tensor_buft_overrides_p;
+ 
++    const bool require_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO_REQUIRED;
++    if (require_direct_io && (fname.empty() || file != nullptr || meta != nullptr || no_alloc)) {
++        throw std::runtime_error("required direct I/O needs named files and allocated tensor loading");
++    }
++#ifndef __linux__
++    if (require_direct_io) {
++        throw std::runtime_error("required direct I/O is only supported on Linux");
++    }
++#endif
+     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
+-    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
++    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO || require_direct_io;
+ 
+     if (!fname.empty()) {
+         // Load the main GGUF
+@@ -576,7 +586,7 @@ llama_model_loader::llama_model_loader(
+         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+-        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
++        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io, require_direct_io));
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset of the main file.
+@@ -644,7 +654,7 @@ llama_model_loader::llama_model_loader(
+                     }
+                 }
+ 
+-                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
++                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io, require_direct_io));
+                 contexts.emplace_back(ctx);
+ 
+                 // Save tensors data offset info of the shard.
+@@ -1118,9 +1128,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+     // set below, before buft_for_tensor() runs
+     bool is_lazy = false;
++    bool is_external = false;
+ 
+     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+-        const ctx_key key { buft, is_lazy };
++        const ctx_key key { buft, is_lazy, is_external };
+ 
+         auto it = ctx_map.find(key);
+         if (it == ctx_map.end()) {
+@@ -1208,6 +1219,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             }
+         }
+ 
++        if (external_tensor && external_tensor(t_meta, external_tensor_user_data)) {
++            const bool expert = op == GGML_OP_MUL_MAT_ID && tn.suffix && strcmp(tn.suffix, "weight") == 0;
++            const bool ple = get_arch() == LLM_ARCH_QWEN4EXP && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD;
++            if (!expert && !ple) {
++                throw std::runtime_error(format("external tensor '%s' has no graph hook", tn.str().c_str()));
++            }
++            is_external = true;
++            return ggml_backend_cpu_buffer_type();
++        }
++
+         if (is_lazy) {
+             return lazy_read::buft();
+         }
+@@ -1339,7 +1360,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         return NULL;
+     }
+ 
+-    if (flags & TENSOR_READ_LAZY) {
++    if (!external_tensor && (flags & TENSOR_READ_LAZY)) {
+         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+     }
+@@ -1381,9 +1402,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+     ggml_set_name(tensor, ggml_get_name(&t_meta));
+ 
+     if (duplicated) {
+-        size_data += ggml_nbytes(&t_meta);
++        if (!is_external) {
++            size_data += ggml_nbytes(&t_meta);
++        }
+     } else {
+         n_created++;
++        if (is_external) {
++            size_data -= ggml_nbytes(&t_meta);
++        }
+     }
+ 
+     return tensor;
+@@ -1672,8 +1698,13 @@ bool llama_model_loader::load_all_data(
+             const auto & file = files.at(weight->idx);
+ 
+             if (ggml_backend_buffer_is_host(cur->buffer)) {
++                llama_load_tensor_scope observed_tensor(weight->idx, ggml_get_name(cur));
++                const auto started = llama_current_load_observer ? llama_load_clock_ns() : 0;
++                llama_observe_load(LLAMA_LOAD_TENSOR_BEGIN, weight->offs, n_size);
+                 file->seek(weight->offs, SEEK_SET);
+                 file->read_raw(cur->data, n_size);
++                llama_observe_load(LLAMA_LOAD_TENSOR_END, weight->offs, n_size, n_size,
++                    llama_current_load_observer ? llama_load_clock_ns() - started : 0);
+                 if (check_tensors) {
+                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
+                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 9e51d0c..f842441 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -84,6 +84,9 @@ struct llama_model_loader {
+     bool no_alloc;
+     bool load_mtp;
+ 
++    llama_external_tensor_callback external_tensor = nullptr;
++    void * external_tensor_user_data = nullptr;
++
+     // handle TENSOR_READ_LAZY
+     // use case: keep PLE / engrams embd tensors on disk, read them on demand
+     struct lazy_read {
+@@ -151,10 +154,14 @@ struct llama_model_loader {
+     struct ctx_key {
+         ggml_backend_buffer_type_t buft;
+         bool lazy;
++        bool external;
+     };
+ 
+     struct ctx_key_comparator {
+         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
++            if (lhs.external != rhs.external) {
++                return lhs.external < rhs.external;
++            }
+             if (lhs.lazy != rhs.lazy) {
+                 return lhs.lazy < rhs.lazy;
+             }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 742bcd5..f360e6f 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-model.h"
++#include "llama-load-observer.h"
+ 
+ #include "llama-arch.h"
+ #include "llama-ext.h"
+@@ -24,6 +25,7 @@
+ 
+ #include "ggml.h"
+ #include "ggml-cpp.h"
++#include "../ggml/src/ggml-backend-impl.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -1509,6 +1511,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+ 
++    if (params.external_tensor || params.external_tensor_op) {
++        if (!params.external_tensor || !params.external_tensor_op || params.n_gpu_layers != 0 || ml.no_alloc || ml.files.empty()) {
++            throw std::runtime_error("external tensors require both callbacks, CPU loading, and a real GGUF file");
++        }
++        ml.external_tensor = params.external_tensor;
++        ml.external_tensor_user_data = params.external_tensor_user_data;
++        ml.use_mmap = false;
++        ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
++    }
++
+     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+         for (const auto & dev : devices) {
+             ggml_backend_dev_props props;
+@@ -1800,16 +1812,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             output->type == GGML_TYPE_NVFP4 &&
+             (output_s || output_in_s)));
+     // populate tensors_by_name
+-    for (auto & [_, ctx_ptr] : ml.ctx_map) {
++    for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
+         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
+             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
++            if (ctx_key.external) {
++                external_tensors.insert(cur);
++            }
+         }
+     }
+ 
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
++    for (const ggml_tensor * tensor : external_tensors) {
++        if (tensor->type == GGML_TYPE_NVFP4 || prec_policy.prec_src1.count(tensor) || prec_policy.prec_acc.count(tensor)) {
++            throw std::runtime_error(format("external tensor '%s' requires an unsupported precision policy", tensor->name));
++        }
++    }
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    ml.init_mappings(params.prefetch_mmap, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+@@ -1824,6 +1844,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         ggml_backend_buffer_type_t buft = ctx_key.buft;
+         ggml_context * ctx = ctx_ptr.get();
+ 
++        if (ctx_key.external) {
++            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::vector<ggml_backend_buffer_ptr>{});
++            continue;
++        }
++
+         // skip contexts without tensors
+         if (ggml_get_first_tensor(ctx) == nullptr) {
+             continue;
+@@ -1880,7 +1905,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                 }
+             } else {
++                const bool observe_cpu = llama_current_load_observer && buft == ggml_backend_cpu_buffer_type();
++                const auto started = observe_cpu ? llama_load_clock_ns() : 0;
++                if (observe_cpu) llama_observe_load(LLAMA_LOAD_BUFFER_BEGIN);
+                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                if (buf && observe_cpu) {
++                    // Acquire ownership before an observer may reject the allocation.
++                    ggml_backend_buffer_ptr observed_owner(buf);
++                    const bool aggregate = ggml_backend_buffer_is_multi_buffer(buf);
++                    llama_observe_load(LLAMA_LOAD_BUFFER_READY, 0, 0, 0,
++                        llama_load_clock_ns() - started,
++                        aggregate ? nullptr : ggml_backend_buffer_get_base(buf),
++                        ggml_backend_buffer_get_size(buf));
++                    observed_owner.release();
++                }
+             }
+             if (buf == nullptr) {
+                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+@@ -2911,6 +2949,34 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+ }
+ 
+ 
++ggml_tensor * llama_model::build_external_tensor_op(ggml_context * ctx, ggml_op op, ggml_tensor * weight,
++        ggml_tensor * input, ggml_tensor * ids) const {
++    if (!external_tensors.count(weight)) {
++        return nullptr;
++    }
++    ggml_tensor * result = params.external_tensor_op(ctx, op, weight, input, ids, params.external_tensor_user_data);
++    if (!result || result->op != GGML_OP_CUSTOM || result->type != GGML_TYPE_F32) {
++        throw std::runtime_error(format("invalid external operation for tensor '%s'", weight->name));
++    }
++    const int64_t ne[4] = {
++        op == GGML_OP_MUL_MAT_ID ? weight->ne[1] : weight->ne[0],
++        op == GGML_OP_MUL_MAT_ID ? ids->ne[0] : input->ne[0],
++        op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1],
++        op == GGML_OP_MUL_MAT_ID ? 1 : input->ne[2],
++    };
++    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++        if (result->ne[i] != ne[i]) {
++            throw std::runtime_error(format("invalid external output shape for tensor '%s'", weight->name));
++        }
++    }
++    for (ggml_tensor * source : result->src) {
++        if (external_tensors.count(source) || (source && external_tensors.count(source->view_src))) {
++            throw std::runtime_error("external weights cannot be graph sources");
++        }
++    }
++    return result;
++}
++
+ //
+ // interface implementation
+ //
+@@ -2928,12 +2994,16 @@ llama_model_params llama_model_default_params() {
+         /*.progress_callback           =*/ nullptr,
+         /*.progress_callback_user_data =*/ nullptr,
+         /*.kv_overrides                =*/ nullptr,
++        /*.external_tensor             =*/ nullptr,
++        /*.external_tensor_op          =*/ nullptr,
++        /*.external_tensor_user_data   =*/ nullptr,
+         /*.vocab_only                  =*/ false,
+         /*.check_tensors               =*/ false,
+         /*.use_extra_bufts             =*/ true,
+         /*.no_host                     =*/ false,
+         /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
++        /*.prefetch_mmap               =*/ true,
+     };
+ 
+     return result;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 2243377..0dde64c 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -639,6 +639,8 @@ struct llama_model {
+ 
+     std::string name = "n/a";
+ 
++    std::vector<llama_model_load_io_info> load_io_info;
++
+     llama_hparams hparams = {};
+     llama_vocab   vocab;
+ 
+@@ -743,6 +745,8 @@ struct llama_model {
+     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
+     std::unordered_set<const ggml_tensor *> can_prefetch;
+ 
++    std::unordered_set<const ggml_tensor *> external_tensors;
++
+     // statically allocated context for assigning
+     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+ 
+@@ -792,6 +796,9 @@ struct llama_model {
+ 
+     ggml_cgraph * build_graph(const llm_graph_params & params) const;
+ 
++    ggml_tensor * build_external_tensor_op(ggml_context * ctx, ggml_op op, ggml_tensor * weight,
++            ggml_tensor * input, ggml_tensor * ids) const;
++
+     virtual void load_stats  (llama_model_loader & ml) = 0;
+     virtual void load_hparams(llama_model_loader & ml) = 0;
+     virtual void load_vocab  (llama_model_loader & ml) = 0;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 9beb148..a6d9605 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -1,4 +1,5 @@
+ #include "llama.h"
++#include "llama-load-observer.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-version.h"
+@@ -61,6 +62,8 @@ const char * llama_load_mode_name(enum llama_load_mode load_mode) {
+             return "mmap+mlock";
+         case LLAMA_LOAD_MODE_DIRECT_IO:
+             return "dio";
++        case LLAMA_LOAD_MODE_DIRECT_IO_REQUIRED:
++            return "dio-required";
+     }
+     GGML_ABORT("fatal error");
+ }
+@@ -72,6 +75,7 @@ enum llama_load_mode llama_load_mode_from_str(const char * str) {
+     if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
+     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
+     if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
++    if (std::strcmp(str, "dio-required") == 0) { return LLAMA_LOAD_MODE_DIRECT_IO_REQUIRED; }
+     GGML_ABORT("unknown load mode: %s", str);
+ }
+ 
+@@ -319,7 +323,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
+             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+ 
+-        ml.lazy.mode = params.lazy_mode;
++        ml.lazy.mode = params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO_REQUIRED ? LLAMA_LAZY_MODE_OFF : params.lazy_mode;
+ 
+         ml.print_info();
+         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+@@ -363,6 +367,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+ 
+         if (params.vocab_only) {
+             LLAMA_LOG_INFO("%s: vocab only - skipping tensors\n", __func__);
++            for (const auto & source : ml.files) {
++                model->load_io_info.push_back(source->load_io_info());
++            }
+             return {0, model_ptr.release()};
+         }
+ 
+@@ -370,6 +377,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+             return {-2, nullptr};
+         }
+ 
++        for (const auto & source : ml.files) {
++            model->load_io_info.push_back(source->load_io_info());
++        }
++
+         return {0, model_ptr.release()};
+     } catch (const std::exception & err) {
+         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
+@@ -449,6 +460,10 @@ struct llama_model * llama_model_init_from_user(
+         llama_model_set_tensor_data_t set_tensor_data,
+         void * set_tensor_data_ud,
+         struct llama_model_params params) {
++    if (params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO_REQUIRED) {
++        LLAMA_LOG_ERROR("%s: required direct I/O needs named model files\n", __func__);
++        return nullptr;
++    }
+     GGML_ASSERT(metadata != nullptr);
+     std::string path_model;
+     std::vector<std::string> splits = {};
+@@ -456,6 +471,19 @@ struct llama_model * llama_model_init_from_user(
+     params.use_extra_bufts = false;
+     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
+ }
++
++size_t llama_model_load_io_count(const struct llama_model * model) {
++    return model ? model->load_io_info.size() : 0;
++}
++
++bool llama_model_get_load_io_info(const struct llama_model * model, size_t shard_index,
++                                struct llama_model_load_io_info * out) {
++    if (!model || !out || shard_index >= model->load_io_info.size()) {
++        return false;
++    }
++    *out = model->load_io_info[shard_index];
++    return true;
++}
+ // deprecated
+ struct llama_model * llama_load_model_from_file(
+         const char * path_model,
+@@ -486,6 +514,18 @@ struct llama_model * llama_model_load_from_splits(
+     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, splits.front(), splits, /*file*/ nullptr, params);
+ }
+ 
++struct llama_model * llama_model_load_from_splits_observed(
++        const char ** paths, size_t n_paths, struct llama_model_params params,
++        const struct llama_load_observer * observer) {
++    try {
++        llama_load_observer_scope scope(observer);
++        return llama_model_load_from_splits(paths, n_paths, params);
++    } catch (const std::exception & error) {
++        LLAMA_LOG_ERROR("%s: %s\n", __func__, error.what());
++        return nullptr;
++    }
++}
++
+ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_model_params params) {
+     if (!file) {
+         LLAMA_LOG_ERROR("%s: file is NULL\n", __func__);
+@@ -618,4 +658,3 @@ const char * llama_print_system_info(void) {
+ 
+     return s.c_str();
+ }
+-
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index facab0e..1d93cfb 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1302,7 +1302,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+     {
+         ggml_tensor * ple = model.per_layer_tok_embd;
+ 
+-        const bool prefetch = model.can_prefetch.count(ple);
++        const bool prefetch = model.can_prefetch.count(ple) && !model.external_tensors.count(ple);
+         if (prefetch) {
+             llama_prefetch_rows(ple, idx.data(), idx.size());
+         }
+@@ -1380,7 +1380,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+     res->add_input(std::move(ple_inp));
+ 
+     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
++    ggml_tensor * emb = model.build_external_tensor_op(ctx0, GGML_OP_GET_ROWS, model.per_layer_tok_embd, rows, nullptr);
++    if (!emb) {
++        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
++    }
+     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+     cb(emb, "ple_embd", -1);
+ 
+diff --git a/src/llama-load-observer.h b/src/llama-load-observer.h
+new file mode 100644
+index 0000000..cd330cb
+--- /dev/null
++++ b/src/llama-load-observer.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include "llama.h"
++#include <chrono>
++#include <stdexcept>
++
++inline thread_local const llama_load_observer * llama_current_load_observer = nullptr;
++inline thread_local int32_t llama_load_shard = -1;
++inline thread_local const char * llama_load_tensor = nullptr;
++inline uint64_t llama_load_clock_ns() {
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++inline void llama_observe_load(llama_load_event_kind kind, uint64_t offset = 0,
++        uint64_t requested = 0, uint64_t completed = 0, uint64_t duration = 0,
++        void * owned = nullptr, uint64_t owned_bytes = 0) {
++    if (!llama_current_load_observer) return;
++    const llama_load_event event{kind, llama_load_clock_ns(), duration,
++        llama_load_shard, llama_load_tensor, offset, requested, completed, owned, owned_bytes};
++    if (!llama_current_load_observer->callback(&event, llama_current_load_observer->user_data)) {
++        throw std::runtime_error("dense load observer rejected event");
++    }
++}
++struct llama_load_observer_scope {
++    explicit llama_load_observer_scope(const llama_load_observer * observer) {
++        if (llama_current_load_observer || !observer || !observer->callback)
++            throw std::runtime_error("invalid or reentrant dense load observer");
++        llama_current_load_observer = observer;
++    }
++    ~llama_load_observer_scope() { llama_current_load_observer = nullptr; }
++};
++struct llama_load_tensor_scope {
++    llama_load_tensor_scope(int32_t shard, const char * name) {
++        llama_load_shard = shard; llama_load_tensor = name;
++    }
++    ~llama_load_tensor_scope() { llama_load_shard = -1; llama_load_tensor = nullptr; }
++};

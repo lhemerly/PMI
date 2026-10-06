@@ -5,3 +5,10 @@
 *.bin
 manifest.json
 /poor-mans-inference-cpp.zip
+
+/build-*/
+/runtime/target/
+/tests/__pycache__/
+
+/tools/__pycache__/
+/models/

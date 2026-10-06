@@ -1,4 +1,5 @@
 import struct
+import sys
 from pathlib import Path
 
 def s(x):
@@ -11,4 +12,6 @@ out += s('blk.0.ffn_up_exps.weight') + struct.pack('<I',3)+struct.pack('<QQQ',32
 out += s('blk.0.attn_norm.weight') + struct.pack('<I',2)+struct.pack('<QQ',2,2)+struct.pack('<I',0)+struct.pack('<Q',160)
 while len(out)%32: out.append(0)
 out += bytes([x%256 for x in range(34*4)]) + bytes([0]) * (160-34*4) + bytes(range(16))
-Path('tests/fixtures/toy.gguf').write_bytes(out)
+path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path('tests/fixtures/toy.gguf')
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_bytes(out)
